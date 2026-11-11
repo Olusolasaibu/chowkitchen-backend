@@ -1,5 +1,14 @@
 node_modules/
 .env
 data/orders.json
+data/vendors.json
+data/alerts.json
 *.log
 .DS_Store
+
+
+
+
+
+
+
