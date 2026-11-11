@@ -1,6 +1,6 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { menu, createOrder, getOrder, getOrderByReference, updateOrder } from "./lib/store.js";
+import { menu, createOrder, getOrder, getOrderByReference, updateOrder, kitchenById, listVendors, getVendor, createVendor, createAlert, getAlert, listAlertsByVendor, updateAlert, markOrderAlertsPaid } from "./lib/store.js";
 import { priceOrder, makeReference } from "./lib/pricing.js";
 import { verifyTransaction, isValidWebhookSignature, ONLINE_METHODS, CHANNELS } from "./lib/paystack.js";
 
@@ -20,6 +20,7 @@ app.post("/api/webhooks/paystack", express.raw({ type: "application/json" }), (r
     // Idempotent: a webhook retry for an already-paid order is a no-op.
     if (order && order.paymentStatus !== "paid" && event.data.amount === order.total * 100) {
       updateOrder(order.id, { paymentStatus: "paid", paidAt: event.data.paid_at || new Date().toISOString() });
+      markOrderAlertsPaid(order.id);
     }
   }
   // Always 200 once the signature checks out, so Paystack stops retrying.
@@ -38,8 +39,88 @@ app.get("/api/storefront", (_req, res) => {
     },
     kitchens: menu.kitchens,
     dishes: menu.dishes,
+    vendors: listVendors(),
   });
 });
+
+// --- Vendors ---------------------------------------------------------------
+app.post("/api/vendors", (req, res) => {
+  const { businessName, phone, whatsapp } = req.body || {};
+  if (!businessName || !phone || !whatsapp) {
+    return res.status(400).json({ error: "businessName, phone and whatsapp are required" });
+  }
+  const vendor = {
+    id: randomUUID(),
+    businessName,
+    phone,
+    whatsapp,
+    createdAt: new Date().toISOString(),
+  };
+  createVendor(vendor);
+  return res.status(201).json({ vendor });
+});
+
+app.get("/api/vendors", (_req, res) => {
+  return res.json({ vendors: listVendors() });
+});
+
+app.get("/api/vendors/:id", (req, res) => {
+  const vendor = getVendor(req.params.id);
+  if (!vendor) return res.status(404).json({ error: "Vendor not found" });
+  return res.json({ vendor });
+});
+
+// --- Vendor alerts ---------------------------------------------------------
+app.get("/api/vendors/:id/alerts", (req, res) => {
+  const vendor = getVendor(req.params.id);
+  if (!vendor) return res.status(404).json({ error: "Vendor not found" });
+  const alerts = listAlertsByVendor(vendor.id);
+  const unreadCount = alerts.filter((a) => a.status === "unread").length;
+  return res.json({ vendor, alerts, unreadCount });
+});
+
+app.post("/api/alerts/:id/read", (req, res) => {
+  const alert = getAlert(req.params.id);
+  if (!alert) return res.status(404).json({ error: "Alert not found" });
+  const updated = updateAlert(alert.id, { status: "read", readAt: new Date().toISOString() });
+  return res.json({ ok: true, alert: updated });
+});
+
+// Create one alert per vendor whose items appear in the order.
+// The vendor total is the sum of that vendor's line totals only —
+// the delivery fee belongs to the platform, not to any single vendor.
+function createAlertsForOrder(order) {
+  const byVendor = new Map();
+  for (const line of order.items) {
+    const kitchen = kitchenById(line.kitchenId);
+    const vendorId = kitchen?.vendorId || null;
+    if (!vendorId) continue;
+    if (!byVendor.has(vendorId)) byVendor.set(vendorId, { lines: [], total: 0 });
+    const group = byVendor.get(vendorId);
+    group.lines.push(line);
+    group.total += line.lineTotal;
+  }
+  const created = [];
+  for (const [vendorId, group] of byVendor.entries()) {
+    const alert = {
+      id: randomUUID(),
+      vendorId,
+      orderId: order.id,
+      reference: order.paystackRef || null,
+      itemsSummary: group.lines.map((l) => `${l.qty}× ${l.name}`).join(", "),
+      total: group.total,
+      customerName: order.customer.name,
+      customerAddress: order.customer.address,
+      customer: { name: order.customer.name, phone: order.customer.phone, address: order.customer.address },
+      status: "unread",
+      paymentStatus: order.paymentStatus,
+      createdAt: new Date().toISOString(),
+    };
+    createAlert(alert);
+    created.push(alert);
+  }
+  return created;
+}
 
 // --- Orders ----------------------------------------------------------------
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -78,6 +159,7 @@ app.post("/api/orders", (req, res) => {
       updatedAt: new Date().toISOString(),
     };
     createOrder(order);
+    createAlertsForOrder(order);
 
     // The frontend opens Paystack Inline with this reference, the total in
     // kobo, and only the channel the customer picked.
@@ -118,6 +200,7 @@ app.post("/api/orders/:id/confirm-payment", async (req, res) => {
       return res.status(402).json({ error: "Paid amount does not match the order total" });
     }
     const paid = updateOrder(order.id, { paymentStatus: "paid", paidAt: data.paid_at });
+    markOrderAlertsPaid(order.id);
     return res.json({ ok: true, order: paid });
   } catch (err) {
     return res.status(502).json({ error: err.message });
